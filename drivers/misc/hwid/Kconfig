@@ -1,0 +1,7 @@
+config MI_HARDWARE_ID
+	tristate "Xiaomi hardware identification module"
+	default n
+	help
+	  Expose the hardware project, revision and resistor ADC values passed
+	  by the Xiaomi boot chain.  The exported symbols are also consumed by
+	  a number of Xiaomi device drivers.
