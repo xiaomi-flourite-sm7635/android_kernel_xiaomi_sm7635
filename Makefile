@@ -1208,6 +1208,16 @@ export MODULES_NSDEPS := $(extmod_prefix)modules.nsdeps
 
 PHONY += headers
 
+ext-mod-dir := ../sm7635-modules
+ext-mod-dirs := \
+	$(ext-mod-dir)/qcom/opensource/audio-kernel \
+	$(ext-mod-dir)/qcom/opensource/dataipa/drivers/platform/msm \
+	../sm7635-display \
+	$(ext-mod-dir)/qcom/opensource/mm-sys-kernel/ubwcp \
+	$(ext-mod-dir)/qcom/opensource/securemsm-kernel/smmu-proxy \
+	$(ext-mod-dir)/nxp/opensource/driver
+ext-mod-dirs := $(subst $(srctree)/,,$(ext-mod-dirs))
+
 #Default location for installed headers
 ifeq ($(KBUILD_EXTMOD),)
 PHONY += archheaders archscripts
@@ -1236,6 +1246,17 @@ ifeq ($(KBUILD_EXTMOD),)
 endif
 	$(Q)$(MAKE) $(hdr-inst)=$(hdr-prefix)include/uapi
 	$(Q)$(MAKE) $(hdr-inst)=$(hdr-prefix)arch/$(SRCARCH)/include/uapi
+	$(Q)set -e; \
+		stage_root=$$(mktemp -d "$(objtree)/.ext-module-headers.XXXXXX"); \
+		trap 'rm -rf "$$stage_root"' EXIT; \
+		i=0; \
+		for d in $(ext-mod-dirs); do \
+			i=$$((i + 1)); \
+			stage="$$stage_root/$$i"; \
+			mkdir -p "$$stage"; \
+			$(MAKE) $(hdr-inst)=$$d/include/uapi dst="$$stage"; \
+			rsync -a "$$stage/" "$(INSTALL_HDR_PATH)/include/"; \
+		done
 
 # ---------------------------------------------------------------------------
 # Devicetree files
