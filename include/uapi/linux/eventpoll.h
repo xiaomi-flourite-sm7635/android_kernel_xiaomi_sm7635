@@ -19,6 +19,10 @@
 #include <linux/fcntl.h>
 #include <linux/types.h>
 
+#ifdef __EXPORTED_HEADERS__
+#include <bits/epoll_event.h>
+#endif
+
 /* Flags for epoll_create1.  */
 #define EPOLL_CLOEXEC O_CLOEXEC
 
@@ -80,6 +84,7 @@
 #define EPOLL_PACKED
 #endif
 
+#ifndef __EXPORTED_HEADERS__
 struct epoll_event {
 	__poll_t events;
 	__u64 data;
@@ -97,4 +102,5 @@ static inline void ep_take_care_of_epollwakeup(struct epoll_event *epev)
 	epev->events &= ~EPOLLWAKEUP;
 }
 #endif
+#endif /* __EXPORTED_HEADERS__ */
 #endif /* _UAPI_LINUX_EVENTPOLL_H */
