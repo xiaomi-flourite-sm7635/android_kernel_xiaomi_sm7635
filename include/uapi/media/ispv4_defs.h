@@ -32,9 +32,9 @@
  * @handle:              Control command payload
  */
 struct ispv4_control {
-	uint32_t op_code;
-	uint32_t size;
-	uint64_t handle;
+	__u32 op_code;
+	__u32 size;
+	__u64 handle;
 };
 
 /* ISP IOCTL */
@@ -49,15 +49,15 @@ struct ispv4_control {
 #define ISPV4_BUSMON_PREFM_STOP _IOWR('B', 3, int)
 
 struct ispv4_cam_control {
-	uint32_t cmd;
-	uint64_t size;
+	__u32 cmd;
+	__u64 size;
 	union {
-		uint64_t priv;
+		__u64 priv;
 		void *uptr;
 	};
 #define ISPV4_ASST_LOG_PARAM_P 0
 #define ISPV4_ASST_LOG_RET_P 1
-	uint32_t params[16];
+	__u32 params[16];
 };
 
 #define ISPV4_CAM_CTL_NR_BASE 250
@@ -153,10 +153,10 @@ enum ispv4_pmic_id {
 };
 
 struct ispv4_pmic_regu {
-	uint32_t ops;
-	uint32_t id;
-	uint32_t en;
-	uint32_t voltage;
+	__u32 ops;
+	__u32 id;
+	__u32 en;
+	__u32 voltage;
 };
 
 enum pcie_msi {
@@ -286,12 +286,12 @@ enum PVT_GET_TYPE {
 #pragma pack(1)
 struct xm_ispv4_rpmsg_pkg {
 	struct {
-		uint32_t id;
-		uint32_t type;
-		uint32_t param;
+		__u32 id;
+		__u32 type;
+		__u32 param;
 	} header;
-	uint32_t func;
-	uint32_t data[0];
+	__u32 func;
+	__u32 data[0];
 };
 #pragma pack()
 
