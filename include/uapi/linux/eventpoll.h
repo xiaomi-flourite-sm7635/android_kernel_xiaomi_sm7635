@@ -19,10 +19,6 @@
 #include <linux/fcntl.h>
 #include <linux/types.h>
 
-#ifdef __EXPORTED_HEADERS__
-#include <bits/epoll_event.h>
-#endif
-
 /* Flags for epoll_create1.  */
 #define EPOLL_CLOEXEC O_CLOEXEC
 
@@ -84,12 +80,18 @@
 #define EPOLL_PACKED
 #endif
 
-#ifndef __EXPORTED_HEADERS__
+#if !defined(__KERNEL__) && \
+	(defined(__ANDROID__) || defined(__BIONIC__))
+/* Bionic exposes the epoll_data_t union in place of the kernel's __u64. */
+#include <bits/epoll_event.h>
+#else
 struct epoll_event {
 	__poll_t events;
 	__u64 data;
 } EPOLL_PACKED;
+#endif
 
+#if defined(__KERNEL__) || !defined(__EXPORTED_HEADERS__)
 #ifdef CONFIG_PM_SLEEP
 static inline void ep_take_care_of_epollwakeup(struct epoll_event *epev)
 {
@@ -102,5 +104,5 @@ static inline void ep_take_care_of_epollwakeup(struct epoll_event *epev)
 	epev->events &= ~EPOLLWAKEUP;
 }
 #endif
-#endif /* __EXPORTED_HEADERS__ */
+#endif /* __KERNEL__ || !__EXPORTED_HEADERS__ */
 #endif /* _UAPI_LINUX_EVENTPOLL_H */

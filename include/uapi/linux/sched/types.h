@@ -3,6 +3,11 @@
 #define _UAPI_LINUX_SCHED_TYPES_H
 
 #include <linux/types.h>
+#if defined(__KERNEL__) || !defined(__EXPORTED_HEADERS__)
+struct sched_param {
+	int sched_priority;
+};
+#endif
 
 #define SCHED_ATTR_SIZE_VER0	48	/* sizeof first published struct */
 #define SCHED_ATTR_SIZE_VER1	56	/* add: util_{min,max} */
