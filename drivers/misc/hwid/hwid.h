@@ -10,6 +10,15 @@
 
 #include <linux/types.h>
 
+/* Xiaomi project IDs used by the shared Qualcomm drivers. */
+#define HARDWARE_PROJECT_UNKNOWN	0
+#define HARDWARE_PROJECT_N3	2
+#define HARDWARE_PROJECT_N11U	3
+#define HARDWARE_PROJECT_N18	7
+#define HARDWARE_PROJECT_O81	10
+#define HARDWARE_PROJECT_O82	11
+#define HARDWARE_PROJECT_P16U	14
+
 enum xiaomi_country_type {
 	COUNTRY_CN = 0x00,
 	COUNTRY_GLOBAL = 0x01,
@@ -17,6 +26,16 @@ enum xiaomi_country_type {
 	COUNTRY_JAPAN = 0x03,
 	COUNTRY_INVALID = 0x04,
 };
+
+/* Keep the vendor spelling used by Xiaomi's out-of-tree drivers. */
+typedef enum {
+	CountryCN = COUNTRY_CN,
+	CountryGlobal = COUNTRY_GLOBAL,
+	CountryIndia = COUNTRY_INDIA,
+	CountryJapan = COUNTRY_JAPAN,
+	INVALID = COUNTRY_INVALID,
+	CountryIDMax = 0x7fffffff,
+} CountryType;
 
 char *product_name_get(void);
 u32 get_hw_project_adc(void);
