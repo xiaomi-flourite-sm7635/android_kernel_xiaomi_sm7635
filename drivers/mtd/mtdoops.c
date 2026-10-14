@@ -60,7 +60,7 @@ MODULE_PARM_DESC(boot_index,
 
 #define MTDOOPS_KERNMSG_MAGIC_v1 0x5d005d00  /* Original */
 #define MTDOOPS_KERNMSG_MAGIC_v2 0x5d005e00  /* Adds the timestamp */
-#define MTDOOPS_HEADER_SIZE   8
+#define MTDOOPS_HEADER_SIZE   sizeof(struct mtdoops_hdr)
 
 enum mtd_dump_reason {
 	MTD_DUMP_UNDEF,
