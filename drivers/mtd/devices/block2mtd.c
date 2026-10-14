@@ -217,20 +217,30 @@ static void block2mtd_free_device(struct block2mtd_dev *dev)
 	kfree(dev);
 }
 
-static int delSubStr(char * src, char * sub,char * result)
+static dev_t block2mtd_lookup_devt(const char *devname)
 {
-	int i,find = 0;
-	int len_src = strlen(src);
-	int len_sub = strlen(sub);
-	for( i = 0 ; i <= len_src - len_sub; i++){
-		if(strncmp(src+i, sub, len_sub)==0){
-			strncpy(result,src,i);
-			strncpy(result+i,src+i+len_sub,len_src-i-len_sub);
-			find =1;
-			break;
-		}
+	const char *suffix;
+	char name[80];
+	int len;
+
+	/* Android's by-name links may not exist when modules are loaded. */
+	if (str_has_prefix(devname, "/dev/block/by-name/")) {
+		suffix = devname + strlen("/dev/block/by-name/");
+		if (!*suffix || strchr(suffix, '/'))
+			return 0;
+		len = snprintf(name, sizeof(name), "PARTLABEL=%s", suffix);
+	} else if (str_has_prefix(devname, "/dev/block/")) {
+		suffix = devname + strlen("/dev/block/");
+		if (!*suffix || strchr(suffix, '/'))
+			return 0;
+		len = snprintf(name, sizeof(name), "/dev/%s", suffix);
+	} else {
+		return name_to_dev_t(devname);
 	}
-	return find;
+
+	if (len < 0 || len >= sizeof(name))
+		return 0;
+	return name_to_dev_t(name);
 }
 
 static struct block2mtd_dev *add_device(char *devname, int erase_size,
@@ -241,7 +251,6 @@ static struct block2mtd_dev *add_device(char *devname, int erase_size,
 	struct block_device *bdev;
 	struct block2mtd_dev *dev;
 	char *name;
-	char name_for_find_devt[80]={0};
 
 	if (!devname)
 		return NULL;
@@ -253,8 +262,6 @@ static struct block2mtd_dev *add_device(char *devname, int erase_size,
 	/* Get a handle on the device */
 	bdev = blkdev_get_by_path(devname, mode, dev);
 
-	if(!delSubStr(devname, "block/",name_for_find_devt))
-		goto err_free_block2mtd;
 	/*
 	 * We might not have the root device mounted at this point.
 	 * Try to resolve the device name by other means.
@@ -271,14 +278,15 @@ static struct block2mtd_dev *add_device(char *devname, int erase_size,
 			msleep(1000);
 		wait_for_device_probe();
 
-		devt = name_to_dev_t(name_for_find_devt);
+		devt = block2mtd_lookup_devt(devname);
 		if (!devt)
 			continue;
 		bdev = blkdev_get_by_dev(devt, mode, dev);
 	}
 
 	if (IS_ERR(bdev)) {
-		pr_err("error: cannot open device %s\n", devname);
+		pr_err("error: cannot open device %s: %ld\n",
+		       devname, PTR_ERR(bdev));
 		goto err_free_block2mtd;
 	}
 	dev->blkdev = bdev;
