@@ -1,0 +1,25 @@
+What:           /sys/class/qcom-battery/parts_charge_pause
+Date:           October 2026
+Contact:        Lufrz
+Description:
+                Experimental, default-off battery charging pause for Xiaomi
+                Parts. Write 1 to request FCC=0; write 0 to restore. Reads are
+                off, active, or restore_pending. Active means a zero FCC was
+                acknowledged and read back, NOT confirmed electrical isolation
+                of the battery. Only wired USB charging is supported.
+
+                Enabling requires good health, 30-95% capacity, 20-40 degrees C,
+                USB online, and a positive, readable FCC to restore. Repeated
+                enabling does not extend a session. Unplugging, invalid readings,
+                a GLINK restart, or a 30-minute boottime deadline ends a session.
+                Checks run every 5 seconds while CPUs are awake, without holding
+                a wake lock; elapsed sleep is included in the next deadline check.
+                Thermal/voltage protections and USB input controls are unchanged.
+
+                Ordinary FCC writers take precedence. A different nonzero FCC
+                from firmware is never overwritten. Failed or uncertain writes
+                retain restoration state; restore_pending retries automatically
+                and also accepts explicit 0. Normal shutdown attempts restoration.
+                No state survives reboot. Forced resets, firmware failures, or a
+                firmware policy which ignores FCC=0 cannot guarantee restoration
+                or charge bypass. Restore explicitly before rebooting or flashing.

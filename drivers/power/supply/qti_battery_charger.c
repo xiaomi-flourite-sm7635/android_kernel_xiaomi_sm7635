@@ -19,6 +19,7 @@
 #include <linux/power_supply.h>
 #include <linux/reboot.h>
 #include <linux/thermal.h>
+#include <linux/timekeeping.h>
 #include <linux/soc/qcom/pmic_glink.h>
 #include <linux/soc/qcom/battery_charger.h>
 #include <linux/soc/qcom/panel_event_notifier.h>
@@ -779,6 +780,19 @@ struct battery_chg_dev {
 	struct class			battery_class;
 	struct pmic_glink_client	*client;
 	struct mutex			rw_lock;
+	struct mutex			parts_charge_lock;
+	struct delayed_work		parts_charge_work;
+	atomic_t			parts_charge_epoch;
+	unsigned int			parts_charge_start_epoch;
+	u64				parts_charge_deadline;
+	u32				parts_charge_saved_fcc;
+	bool				parts_charge_owned;
+	bool				parts_charge_active;
+	bool				parts_charge_stopping;
+	bool				parts_strict_request;
+	u32				parts_request_opcode;
+	u32				parts_request_property;
+	u32				parts_response_value;
 	struct rw_semaphore		state_sem;
 	struct completion		ack;
 	struct completion		fw_buf_ack;
@@ -1248,6 +1262,8 @@ static void battery_chg_state_cb(void *priv, enum pmic_glink_state state)
 		return;
 	}
 	atomic_set(&bcdev->state, state);
+	if (state == PMIC_GLINK_STATE_DOWN)
+		atomic_inc(&bcdev->parts_charge_epoch);
 	up_write(&bcdev->state_sem);
 
 	if (state == PMIC_GLINK_STATE_UP)
@@ -1336,6 +1352,18 @@ static void handle_message(struct battery_chg_dev *bcdev, void *data,
 	struct wireless_tx_uuid_msg *wireless_tx_uuid_msg = data;
 	struct psy_state *pst;
 	bool ack_set = false;
+
+	/* Do not accept an unrelated ACK or a cached value for the Parts control. */
+	if (smp_load_acquire(&bcdev->parts_strict_request)) {
+		if (len != sizeof(*resp_msg) ||
+		    resp_msg->hdr.opcode != bcdev->parts_request_opcode ||
+		    resp_msg->property_id != bcdev->parts_request_property)
+			return;
+		bcdev->error_prop = resp_msg->ret_code != 0;
+		bcdev->parts_response_value = resp_msg->value;
+		complete(&bcdev->ack);
+		return;
+	}
 
 	switch (resp_msg->hdr.opcode) {
 	case BC_BATTERY_STATUS_GET:
@@ -2910,17 +2938,258 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 	return rc;
 }
 
+/* Experimental FCC pause, not a claim that the battery is electrically isolated. */
+#define PARTS_CHARGE_SECONDS (30 * 60)
+#define PARTS_CHARGE_POLL (5 * HZ)
+
+static int parts_charge_xfer(struct battery_chg_dev *bcdev, int type,
+			    u32 property, bool write, u32 *value)
+{
+	struct psy_state *pst = &bcdev->psy_list[type];
+	struct battery_charger_req_msg msg = { 0 };
+	int rc;
+
+	msg.hdr.owner = MSG_OWNER_BC;
+	msg.hdr.type = MSG_TYPE_REQ_RESP;
+	msg.hdr.opcode = write ? pst->opcode_set : pst->opcode_get;
+	msg.property_id = property;
+	msg.value = write ? *value : 0;
+
+	down_read(&bcdev->state_sem);
+	if (!bcdev->initialized ||
+	    atomic_read(&bcdev->state) != PMIC_GLINK_STATE_UP) {
+		rc = -ENOTCONN;
+		goto unlock_state;
+	}
+	if (bcdev->debug_battery_detected && bcdev->block_tx) {
+		rc = -EBUSY;
+		goto unlock_state;
+	}
+	mutex_lock(&bcdev->rw_lock);
+	bcdev->parts_request_opcode = msg.hdr.opcode;
+	bcdev->parts_request_property = property;
+	bcdev->error_prop = false;
+	reinit_completion(&bcdev->ack);
+	/* Publish the expected response fields before the receive callback can run. */
+	smp_store_release(&bcdev->parts_strict_request, true);
+	rc = pmic_glink_write(bcdev->client, &msg, sizeof(msg));
+	if (!rc) {
+		if (!wait_for_completion_timeout(&bcdev->ack,
+					msecs_to_jiffies(BC_WAIT_TIME_MS)))
+			rc = -ETIMEDOUT;
+		else if (bcdev->error_prop)
+			rc = -EREMOTEIO;
+		else if (!write)
+			*value = bcdev->parts_response_value;
+	}
+	/* Retire strict matching before another rw_lock holder sends a request. */
+	smp_store_release(&bcdev->parts_strict_request, false);
+	mutex_unlock(&bcdev->rw_lock);
+unlock_state:
+	up_read(&bcdev->state_sem);
+	return rc;
+}
+
+static int parts_charge_fcc(struct battery_chg_dev *bcdev, bool write, u32 *value)
+{
+	return parts_charge_xfer(bcdev, PSY_TYPE_BATTERY,
+				BATT_CONSTANT_CURRENT, write, value);
+}
+
+/* Caller holds parts_charge_lock. Never overwrite another controller's nonzero FCC. */
+static int parts_charge_restore(struct battery_chg_dev *bcdev)
+{
+	u32 value = 0;
+	int rc;
+
+	bcdev->parts_charge_active = false;
+	if (!bcdev->parts_charge_owned)
+		return 0;
+	rc = parts_charge_fcc(bcdev, false, &value);
+	if (rc)
+		return rc;
+	if (!value) {
+		value = bcdev->parts_charge_saved_fcc;
+		rc = parts_charge_fcc(bcdev, true, &value);
+		if (rc)
+			return rc;
+		rc = parts_charge_fcc(bcdev, false, &value);
+		if (rc)
+			return rc;
+		if (!value)
+			return -EIO;
+	}
+	bcdev->parts_charge_owned = false;
+	return 0;
+}
+
+static int parts_charge_check(struct battery_chg_dev *bcdev)
+{
+	u32 value = 0;
+	int rc;
+
+	rc = parts_charge_xfer(bcdev, PSY_TYPE_USB, USB_ONLINE, false, &value);
+	if (rc || value != 1)
+		return rc ?: -ENODEV;
+	rc = parts_charge_xfer(bcdev, PSY_TYPE_BATTERY, BATT_HEALTH, false, &value);
+	if (rc || value != POWER_SUPPLY_HEALTH_GOOD)
+		return rc ?: -ERANGE;
+	rc = parts_charge_xfer(bcdev, PSY_TYPE_BATTERY, BATT_CAPACITY, false, &value);
+	if (rc || value < 3000 || value > 9500)
+		return rc ?: -ERANGE;
+	/* The remote service reports centidegrees, before power_supply conversion. */
+	rc = parts_charge_xfer(bcdev, PSY_TYPE_BATTERY, BATT_TEMP, false, &value);
+	if (rc || (s32)value < 2000 || (s32)value > 4000)
+		return rc ?: -ERANGE;
+	return 0;
+}
+
+static void parts_charge_queue(struct battery_chg_dev *bcdev)
+{
+	if (bcdev->parts_charge_owned && !bcdev->parts_charge_stopping)
+		mod_delayed_work(system_wq, &bcdev->parts_charge_work, PARTS_CHARGE_POLL);
+}
+
+static void parts_charge_work(struct work_struct *work)
+{
+	struct battery_chg_dev *bcdev = container_of(work, struct battery_chg_dev,
+						   parts_charge_work.work);
+	u32 value = 0;
+
+	mutex_lock(&bcdev->parts_charge_lock);
+	if (bcdev->parts_charge_stopping || !bcdev->parts_charge_owned)
+		goto out;
+	if (!bcdev->parts_charge_active ||
+	    bcdev->parts_charge_start_epoch != atomic_read(&bcdev->parts_charge_epoch) ||
+	    ktime_get_boottime_seconds() >= bcdev->parts_charge_deadline ||
+	    parts_charge_check(bcdev) || parts_charge_fcc(bcdev, false, &value)) {
+		parts_charge_restore(bcdev);
+	} else if (value) {
+		/* Firmware or another client changed the limit: never fight it. */
+		bcdev->parts_charge_owned = false;
+		bcdev->parts_charge_active = false;
+	}
+	parts_charge_queue(bcdev);
+out:
+	mutex_unlock(&bcdev->parts_charge_lock);
+}
+
+static ssize_t parts_charge_pause_show(struct class *c,
+				      struct class_attribute *attr, char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev, battery_class);
+	const char *state;
+
+	mutex_lock(&bcdev->parts_charge_lock);
+	state = !bcdev->parts_charge_owned ? "off" :
+		bcdev->parts_charge_active ? "active" : "restore_pending";
+	sysfs_emit(buf, "%s\n", state);
+	mutex_unlock(&bcdev->parts_charge_lock);
+	return strlen(buf);
+}
+
+static ssize_t parts_charge_pause_store(struct class *c, struct class_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev, battery_class);
+	u32 value = 0;
+	bool enable;
+	int rc;
+
+	if (kstrtobool(buf, &enable))
+		return -EINVAL;
+	mutex_lock(&bcdev->parts_charge_lock);
+	if (bcdev->parts_charge_stopping) {
+		rc = -ENODEV;
+		goto out;
+	}
+	if (!enable) {
+		rc = parts_charge_restore(bcdev);
+		goto queue;
+	}
+	/* No lease renewal, and no new session while restoration is unresolved. */
+	if (bcdev->parts_charge_owned) {
+		rc = -EBUSY;
+		goto out;
+	}
+	bcdev->parts_charge_start_epoch = atomic_read(&bcdev->parts_charge_epoch);
+	rc = parts_charge_check(bcdev);
+	if (rc)
+		goto out;
+	rc = parts_charge_fcc(bcdev, false, &value);
+	if (rc)
+		goto out;
+	if (!value || value > INT_MAX) {
+		rc = -ERANGE;
+		goto out;
+	}
+	bcdev->parts_charge_saved_fcc = value;
+	/* Retain restoration state even if a write times out after reaching firmware. */
+	bcdev->parts_charge_owned = true;
+	value = 0;
+	rc = parts_charge_fcc(bcdev, true, &value);
+	if (!rc)
+		rc = parts_charge_fcc(bcdev, false, &value);
+	if (!rc && value)
+		rc = -EOPNOTSUPP;
+	if (!rc && bcdev->parts_charge_start_epoch != atomic_read(&bcdev->parts_charge_epoch))
+		rc = -ENOTCONN;
+	if (rc) {
+		parts_charge_restore(bcdev);
+	} else {
+		bcdev->parts_charge_deadline = ktime_get_boottime_seconds() + PARTS_CHARGE_SECONDS;
+		bcdev->parts_charge_active = true;
+	}
+queue:
+	parts_charge_queue(bcdev);
+out:
+	mutex_unlock(&bcdev->parts_charge_lock);
+	return rc ? rc : (ssize_t)count;
+}
+static CLASS_ATTR_RW(parts_charge_pause);
+
+static void parts_charge_stop(struct battery_chg_dev *bcdev)
+{
+	int rc;
+
+	mutex_lock(&bcdev->parts_charge_lock);
+	bcdev->parts_charge_stopping = true;
+	rc = parts_charge_restore(bcdev);
+	mutex_unlock(&bcdev->parts_charge_lock);
+	cancel_delayed_work_sync(&bcdev->parts_charge_work);
+	if (rc)
+		dev_warn(bcdev->dev, "Charge pause restore failed: %d\n", rc);
+}
+
 static int battery_psy_set_fcc(struct battery_chg_dev *bcdev, u32 prop_id, int val)
 {
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
-	u32 temp;
+	u32 temp, observed = 0;
 	int rc;
 
 	temp = val;
 	if (val < 0)
 		temp = UINT_MAX;
 
-	rc = write_property_id(bcdev, pst, prop_id, temp);
+	mutex_lock(&bcdev->parts_charge_lock);
+	if (bcdev->parts_charge_owned) {
+		/* An ordinary FCC writer takes precedence over the experimental session. */
+		bcdev->parts_charge_active = false;
+		rc = parts_charge_fcc(bcdev, true, &temp);
+		if (!rc && temp && temp != UINT_MAX) {
+			/* Keep the new client's limit if its acknowledged write was ignored. */
+			bcdev->parts_charge_saved_fcc = temp;
+			rc = parts_charge_fcc(bcdev, false, &observed);
+			if (!rc && !observed)
+				rc = -EIO;
+		}
+		if (!rc)
+			bcdev->parts_charge_owned = false;
+		parts_charge_queue(bcdev);
+	} else {
+		rc = write_property_id(bcdev, pst, prop_id, temp);
+	}
+	mutex_unlock(&bcdev->parts_charge_lock);
 
 	return rc;
 }
@@ -9679,6 +9948,7 @@ static CLASS_ATTR_RO(fg2_design_capacity);
 #endif
 
 static struct attribute *battery_class_attrs[] = {
+	&class_attr_parts_charge_pause.attr,
 	&class_attr_soh.attr,
 	&class_attr_resistance.attr,
 	&class_attr_moisture_detection_status.attr,
@@ -9986,6 +10256,7 @@ static struct attribute *battery_class_attrs[] = {
 ATTRIBUTE_GROUPS(battery_class);
 
 static struct attribute *battery_class_usb_2_attrs[] = {
+	&class_attr_parts_charge_pause.attr,
 	&class_attr_soh.attr,
 	&class_attr_resistance.attr,
 	&class_attr_moisture_detection_status.attr,
@@ -10236,6 +10507,8 @@ static int battery_chg_shutdown(struct notifier_block *nb, unsigned long code,
 	int rc,shipmode,afp_temp;
   	char prop_buf1[10];
   	char prop_buf2[10];
+
+	parts_charge_stop(bcdev);
 
   	shipmode_count_reset_show(&(bcdev->battery_class), NULL, prop_buf1);
   	if (kstrtoint(prop_buf1, 10, &shipmode))
@@ -10664,6 +10937,9 @@ static int battery_chg_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mutex_init(&bcdev->rw_lock);
+	mutex_init(&bcdev->parts_charge_lock);
+	atomic_set(&bcdev->parts_charge_epoch, 0);
+	INIT_DELAYED_WORK(&bcdev->parts_charge_work, parts_charge_work);
 	init_rwsem(&bcdev->state_sem);
 	init_completion(&bcdev->ack);
 	init_completion(&bcdev->fw_buf_ack);
@@ -10778,6 +11054,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 
 	return 0;
 error:
+	parts_charge_stop(bcdev);
 	down_write(&bcdev->state_sem);
 	atomic_set(&bcdev->state, PMIC_GLINK_STATE_DOWN);
 	bcdev->initialized = false;
@@ -10802,6 +11079,8 @@ static int battery_chg_remove(struct platform_device *pdev)
 {
 	struct battery_chg_dev *bcdev = platform_get_drvdata(pdev);
 
+	class_unregister(&bcdev->battery_class);
+	parts_charge_stop(bcdev);
 	down_write(&bcdev->state_sem);
 	atomic_set(&bcdev->state, PMIC_GLINK_STATE_DOWN);
 	bcdev->initialized = false;
@@ -10809,7 +11088,6 @@ static int battery_chg_remove(struct platform_device *pdev)
 
 	device_init_wakeup(bcdev->dev, false);
 	debugfs_remove_recursive(bcdev->debugfs_dir);
-	class_unregister(&bcdev->battery_class);
 	pmic_glink_unregister_client(bcdev->client);
 	cancel_work_sync(&bcdev->subsys_up_work);
 	cancel_work_sync(&bcdev->usb_type_work);
