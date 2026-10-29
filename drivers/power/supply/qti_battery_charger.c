@@ -3008,7 +3008,7 @@ static int battery_psy_set_prop(struct power_supply *psy,
 {
 	struct battery_chg_dev *bcdev = power_supply_get_drvdata(psy);
 	struct psy_state *pst =&bcdev->psy_list[PSY_TYPE_BATTERY];
-	int prop_id, rc = 0;
+	int prop_id;
 
 	prop_id = get_property_id(pst, prop);
 	if (prop_id < 0)
@@ -3018,8 +3018,7 @@ static int battery_psy_set_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		return battery_psy_set_charge_current(bcdev, pval->intval);
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
-		rc = battery_psy_set_fcc(bcdev, prop_id, pval->intval);
-		break;
+		return battery_psy_set_fcc(bcdev, prop_id, pval->intval);
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 		return battery_psy_set_charge_start_threshold(bcdev,
 								pval->intval);
@@ -3029,8 +3028,6 @@ static int battery_psy_set_prop(struct power_supply *psy,
 	default:
 		return -EINVAL;
 	}
-
-	return 0;
 }
 
 static int battery_psy_prop_is_writeable(struct power_supply *psy,
