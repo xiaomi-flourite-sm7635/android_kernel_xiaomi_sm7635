@@ -74,7 +74,7 @@ static void boost_adjust_notify(struct cpufreq_policy *policy)
 
 	if (ret < 0)
 		pr_err("Failed to update freq constraint in boost_adjust: %d\n",
-								ib_min);
+								ret);
 
 	pr_debug("CPU%u policy min after boost: %u kHz\n", cpu, policy->min);
 }
@@ -92,20 +92,22 @@ static void update_policy_online(void)
 		policy = cpufreq_cpu_get(i);
 		if (!policy) {
 			pr_err("%s: cpufreq policy not found for cpu%d\n",
-							__func__, i);
-			return;
+						__func__, i);
+			continue;
 		}
 
 		cpumask_andnot(&online_cpus, &online_cpus,
 						policy->related_cpus);
 		boost_adjust_notify(policy);
+		cpufreq_cpu_put(policy);
 	}
 	cpus_read_unlock();
 }
 
 static void do_input_boost_rem(struct work_struct *work)
 {
-	unsigned int i, ret;
+	unsigned int i;
+	int ret;
 	struct cpu_sync *i_sync_info;
 
 	/* Reset the input_boost_min for all CPUs in the system */
@@ -120,7 +122,7 @@ static void do_input_boost_rem(struct work_struct *work)
 
 	if (sched_boost_active) {
 		ret = sched_set_boost(0);
-		if (!ret)
+		if (ret)
 			pr_err("input-boost: sched boost disable failed\n");
 		sched_boost_active = false;
 	}
@@ -278,23 +280,41 @@ int input_boost_init(void)
 	for_each_possible_cpu(cpu) {
 		s = &per_cpu(sync_info, cpu);
 		s->cpu = cpu;
-		req = &per_cpu(qos_req, cpu);
 		policy = cpufreq_cpu_get(cpu);
 		if (!policy) {
 			pr_err("%s: cpufreq policy not found for cpu%d\n",
 							__func__, cpu);
-			return -ESRCH;
+			ret = -ESRCH;
+			goto err_requests;
 		}
 
+		/* Shared policies need only one request, inactive until input. */
+		req = &per_cpu(qos_req, policy->cpu);
+		if (freq_qos_request_active(req)) {
+			cpufreq_cpu_put(policy);
+			continue;
+		}
 		ret = freq_qos_add_request(&policy->constraints, req,
-						FREQ_QOS_MIN, policy->min);
+						FREQ_QOS_MIN, 0);
+		cpufreq_cpu_put(policy);
 		if (ret < 0) {
 			pr_err("%s: Failed to add freq constraint (%d)\n",
 							__func__, ret);
-			return ret;
+			goto err_requests;
 		}
 	}
 
 	ret = input_register_handler(&inputboost_input_handler);
+	if (ret)
+		goto err_requests;
 	return 0;
+
+err_requests:
+	for_each_possible_cpu(cpu) {
+		req = &per_cpu(qos_req, cpu);
+		if (freq_qos_request_active(req))
+			freq_qos_remove_request(req);
+	}
+	destroy_workqueue(input_boost_wq);
+	return ret;
 }
