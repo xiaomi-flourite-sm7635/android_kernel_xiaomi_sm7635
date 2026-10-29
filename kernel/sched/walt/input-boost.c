@@ -60,7 +60,8 @@ static DEFINE_PER_CPU(struct freq_qos_request, qos_req);
 
 static void boost_adjust_notify(struct cpufreq_policy *policy)
 {
-	unsigned int cpu = policy->cpu;
+	/* The policy's online representative may change after CPU hotplug. */
+	unsigned int cpu = cpumask_first(policy->related_cpus);
 	struct cpu_sync *s = &per_cpu(sync_info, cpu);
 	unsigned int ib_min = s->input_boost_min;
 	struct freq_qos_request *req = &per_cpu(qos_req, cpu);
@@ -117,8 +118,16 @@ static void do_input_boost_rem(struct work_struct *work)
 		i_sync_info->input_boost_min = 0;
 	}
 
-	/* Update policies for all online CPUs */
-	update_policy_online();
+	/* Release requests even if a whole policy has gone offline. */
+	for_each_possible_cpu(i) {
+		struct freq_qos_request *req = &per_cpu(qos_req, i);
+
+		if (!freq_qos_request_active(req))
+			continue;
+		ret = freq_qos_update_request(req, 0);
+		if (ret < 0)
+			pr_err("Failed to release freq constraint: %d\n", ret);
+	}
 
 	if (sched_boost_active) {
 		ret = sched_set_boost(0);
@@ -289,7 +298,7 @@ int input_boost_init(void)
 		}
 
 		/* Shared policies need only one request, inactive until input. */
-		req = &per_cpu(qos_req, policy->cpu);
+		req = &per_cpu(qos_req, cpumask_first(policy->related_cpus));
 		if (freq_qos_request_active(req)) {
 			cpufreq_cpu_put(policy);
 			continue;
