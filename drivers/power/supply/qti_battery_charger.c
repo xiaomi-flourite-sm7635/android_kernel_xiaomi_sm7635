@@ -2941,6 +2941,7 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 /* Experimental FCC pause, not a claim that the battery is electrically isolated. */
 #define PARTS_CHARGE_SECONDS (30 * 60)
 #define PARTS_CHARGE_POLL (5 * HZ)
+#define PARTS_CHARGE_SETTLE_TRIES 10
 
 static int parts_charge_xfer(struct battery_chg_dev *bcdev, int type,
 			    u32 property, bool write, u32 *value)
@@ -2996,6 +2997,28 @@ static int parts_charge_fcc(struct battery_chg_dev *bcdev, bool write, u32 *valu
 				BATT_CONSTANT_CURRENT, write, value);
 }
 
+static int parts_charge_wait_fcc(struct battery_chg_dev *bcdev, bool paused)
+{
+	u32 value = 0;
+	int rc, attempt, matches = 0;
+
+	/* An acknowledged firmware write need not be visible in the first GET. */
+	for (attempt = 0; attempt < PARTS_CHARGE_SETTLE_TRIES; attempt++) {
+		if (attempt)
+			msleep(100);
+		rc = parts_charge_fcc(bcdev, false, &value);
+		if (rc)
+			return rc;
+		if (paused ? !value : (value && value <= INT_MAX)) {
+			if (++matches == 2)
+				return 0;
+		} else {
+			matches = 0;
+		}
+	}
+	return -EAGAIN;
+}
+
 /* Caller holds parts_charge_lock. Never overwrite another controller's nonzero FCC. */
 static int parts_charge_restore(struct battery_chg_dev *bcdev)
 {
@@ -3008,16 +3031,20 @@ static int parts_charge_restore(struct battery_chg_dev *bcdev)
 	rc = parts_charge_fcc(bcdev, false, &value);
 	if (rc)
 		return rc;
-	if (!value) {
+	if (!value || value == bcdev->parts_charge_saved_fcc) {
+		/*
+		 * The old FCC may still be visible while a prior zero write is pending.
+		 * Explicitly cancel that write before relinquishing restoration state.
+		 */
 		value = bcdev->parts_charge_saved_fcc;
 		rc = parts_charge_fcc(bcdev, true, &value);
 		if (rc)
 			return rc;
-		rc = parts_charge_fcc(bcdev, false, &value);
+		rc = parts_charge_wait_fcc(bcdev, false);
 		if (rc)
 			return rc;
-		if (!value)
-			return -EIO;
+	} else if (value > INT_MAX) {
+		return -ERANGE;
 	}
 	bcdev->parts_charge_owned = false;
 	return 0;
@@ -3055,8 +3082,10 @@ static void parts_charge_work(struct work_struct *work)
 	struct battery_chg_dev *bcdev = container_of(work, struct battery_chg_dev,
 						   parts_charge_work.work);
 	u32 value = 0;
+	bool was_active, changed;
 
 	mutex_lock(&bcdev->parts_charge_lock);
+	was_active = bcdev->parts_charge_active;
 	if (bcdev->parts_charge_stopping || !bcdev->parts_charge_owned)
 		goto out;
 	if (!bcdev->parts_charge_active ||
@@ -3071,7 +3100,10 @@ static void parts_charge_work(struct work_struct *work)
 	}
 	parts_charge_queue(bcdev);
 out:
+	changed = was_active != bcdev->parts_charge_active;
 	mutex_unlock(&bcdev->parts_charge_lock);
+	if (changed)
+		power_supply_changed(bcdev->psy_list[PSY_TYPE_BATTERY].psy);
 }
 
 static ssize_t parts_charge_pause_show(struct class *c,
@@ -3093,12 +3125,13 @@ static ssize_t parts_charge_pause_store(struct class *c, struct class_attribute 
 {
 	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev, battery_class);
 	u32 value = 0;
-	bool enable;
+	bool enable, was_active, changed;
 	int rc;
 
 	if (kstrtobool(buf, &enable))
 		return -EINVAL;
 	mutex_lock(&bcdev->parts_charge_lock);
+	was_active = bcdev->parts_charge_active;
 	if (bcdev->parts_charge_stopping) {
 		rc = -ENODEV;
 		goto out;
@@ -3129,13 +3162,14 @@ static ssize_t parts_charge_pause_store(struct class *c, struct class_attribute 
 	value = 0;
 	rc = parts_charge_fcc(bcdev, true, &value);
 	if (!rc)
-		rc = parts_charge_fcc(bcdev, false, &value);
-	if (!rc && value)
-		rc = -EOPNOTSUPP;
+		rc = parts_charge_wait_fcc(bcdev, true);
 	if (!rc && bcdev->parts_charge_start_epoch != atomic_read(&bcdev->parts_charge_epoch))
 		rc = -ENOTCONN;
 	if (rc) {
-		parts_charge_restore(bcdev);
+		int restore_rc = parts_charge_restore(bcdev);
+
+		dev_warn(bcdev->dev, "Charge pause not confirmed: %d, restore: %d\n",
+			 rc, restore_rc);
 	} else {
 		bcdev->parts_charge_deadline = ktime_get_boottime_seconds() + PARTS_CHARGE_SECONDS;
 		bcdev->parts_charge_active = true;
@@ -3143,7 +3177,10 @@ static ssize_t parts_charge_pause_store(struct class *c, struct class_attribute 
 queue:
 	parts_charge_queue(bcdev);
 out:
+	changed = was_active != bcdev->parts_charge_active;
 	mutex_unlock(&bcdev->parts_charge_lock);
+	if (changed)
+		power_supply_changed(bcdev->psy_list[PSY_TYPE_BATTERY].psy);
 	return rc ? rc : (ssize_t)count;
 }
 static CLASS_ATTR_RW(parts_charge_pause);
@@ -3165,6 +3202,7 @@ static int battery_psy_set_fcc(struct battery_chg_dev *bcdev, u32 prop_id, int v
 {
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
 	u32 temp, observed = 0;
+	bool was_active, changed;
 	int rc;
 
 	temp = val;
@@ -3172,6 +3210,7 @@ static int battery_psy_set_fcc(struct battery_chg_dev *bcdev, u32 prop_id, int v
 		temp = UINT_MAX;
 
 	mutex_lock(&bcdev->parts_charge_lock);
+	was_active = bcdev->parts_charge_active;
 	if (bcdev->parts_charge_owned) {
 		/* An ordinary FCC writer takes precedence over the experimental session. */
 		bcdev->parts_charge_active = false;
@@ -3189,9 +3228,23 @@ static int battery_psy_set_fcc(struct battery_chg_dev *bcdev, u32 prop_id, int v
 	} else {
 		rc = write_property_id(bcdev, pst, prop_id, temp);
 	}
+	changed = was_active != bcdev->parts_charge_active;
 	mutex_unlock(&bcdev->parts_charge_lock);
+	if (changed)
+		power_supply_changed(pst->psy);
 
 	return rc;
+}
+
+static int parts_charge_status(struct battery_chg_dev *bcdev, int status)
+{
+	mutex_lock(&bcdev->parts_charge_lock);
+	/* FCC=0 may be reported as FULL by firmware even below full capacity. */
+	if (bcdev->parts_charge_active &&
+	    (status == POWER_SUPPLY_STATUS_CHARGING || status == POWER_SUPPLY_STATUS_FULL))
+		status = POWER_SUPPLY_STATUS_NOT_CHARGING;
+	mutex_unlock(&bcdev->parts_charge_lock);
+	return status;
 }
 
 static bool check_batt_capacity_whether_glink_timeout(struct power_supply *psy)
@@ -3262,6 +3315,7 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		if ((pval->intval == POWER_SUPPLY_STATUS_CHARGING && bcdev->report_power_absent)
                     || bcdev->glink_crash_count > 3)
 			pval->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+		pval->intval = parts_charge_status(bcdev, pval->intval);
 		break;
 	default:
 		pval->intval = pst->prop[prop_id];

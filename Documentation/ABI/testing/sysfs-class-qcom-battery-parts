@@ -8,6 +8,15 @@ Description:
                 acknowledged and read back, NOT confirmed electrical isolation
                 of the battery. Only wired USB charging is supported.
 
+                While active, battery/status reports Not charging instead of
+                firmware Charging or Full. Discharging and error states are
+                preserved. Session transitions notify power_supply consumers.
+                Firmware readback is allowed to settle for up to ten queries
+                spaced 100 ms apart, requiring two consecutive matching values.
+                Transport timeouts can add latency. An unconfirmed zero write
+                is explicitly cancelled if the old FCC is still reported; it
+                must not silently leave a delayed zero request outstanding.
+
                 Enabling requires good health, 30-95% capacity, 20-40 degrees C,
                 USB online, and a positive, readable FCC to restore. Repeated
                 enabling does not extend a session. Unplugging, invalid readings,
