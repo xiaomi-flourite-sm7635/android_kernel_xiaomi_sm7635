@@ -3058,16 +3058,7 @@ static int parts_charge_check(struct battery_chg_dev *bcdev)
 	rc = parts_charge_xfer(bcdev, PSY_TYPE_USB, USB_ONLINE, false, &value);
 	if (rc || value != 1)
 		return rc ?: -ENODEV;
-	rc = parts_charge_xfer(bcdev, PSY_TYPE_BATTERY, BATT_HEALTH, false, &value);
-	if (rc || value != POWER_SUPPLY_HEALTH_GOOD)
-		return rc ?: -ERANGE;
-	rc = parts_charge_xfer(bcdev, PSY_TYPE_BATTERY, BATT_CAPACITY, false, &value);
-	if (rc || value < 3000 || value > 9500)
-		return rc ?: -ERANGE;
-	/* The remote service reports centidegrees, before power_supply conversion. */
-	rc = parts_charge_xfer(bcdev, PSY_TYPE_BATTERY, BATT_TEMP, false, &value);
-	if (rc || (s32)value < 2000 || (s32)value > 4000)
-		return rc ?: -ERANGE;
+	/* FCC=0 only pauses charging; firmware retains all battery protections. */
 	return 0;
 }
 

@@ -17,9 +17,11 @@ Description:
                 is explicitly cancelled if the old FCC is still reported; it
                 must not silently leave a delayed zero request outstanding.
 
-                Enabling requires good health, 30-95% capacity, 20-40 degrees C,
-                USB online, and a positive, readable FCC to restore. Repeated
-                enabling does not extend a session. Unplugging, invalid readings,
+                Enabling requires USB online and a positive, readable FCC to
+                restore. No additional capacity, temperature or health gate is
+                imposed by this pause control. Firmware battery protections
+                remain authoritative. Repeated enabling does not extend a
+                session. Unplugging, invalid USB/FCC readings,
                 a GLINK restart, or a 30-minute boottime deadline ends a session.
                 Checks run every 5 seconds while CPUs are awake, without holding
                 a wake lock; elapsed sleep is included in the next deadline check.
