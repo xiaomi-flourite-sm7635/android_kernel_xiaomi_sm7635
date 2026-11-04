@@ -116,9 +116,10 @@ sesInfoFree(struct cifs_ses *buf_to_free)
 }
 
 struct cifs_tcon *
-tconInfoAlloc(void)
+tconInfoAlloc(enum smb3_tcon_ref_trace trace)
 {
 	struct cifs_tcon *ret_buf;
+	static atomic_t tcon_debug_id;
 
 	ret_buf = kzalloc(sizeof(*ret_buf), GFP_KERNEL);
 	if (!ret_buf)
@@ -131,7 +132,8 @@ tconInfoAlloc(void)
 
 	atomic_inc(&tconInfoAllocCount);
 	ret_buf->status = TID_NEW;
-	++ret_buf->tc_count;
+	ret_buf->debug_id = atomic_inc_return(&tcon_debug_id);
+	ret_buf->tc_count = 1;
 	spin_lock_init(&ret_buf->tc_lock);
 	INIT_LIST_HEAD(&ret_buf->openFileList);
 	INIT_LIST_HEAD(&ret_buf->tcon_list);
@@ -142,17 +144,22 @@ tconInfoAlloc(void)
 	ret_buf->old_status = TID_NEW;
 	ret_buf->reconn_for_idle = 0;
 	ret_buf->reconn_for_open = 0;
+#ifdef CONFIG_CIFS_FSCACHE
+	mutex_init(&ret_buf->fscache_lock);
+#endif
+	trace_smb3_tcon_ref(ret_buf->debug_id, ret_buf->tc_count, trace);
 
 	return ret_buf;
 }
 
 void
-tconInfoFree(struct cifs_tcon *tcon)
+tconInfoFree(struct cifs_tcon *tcon, enum smb3_tcon_ref_trace trace)
 {
 	if (tcon == NULL) {
 		cifs_dbg(FYI, "Null buffer passed to tconInfoFree\n");
 		return;
 	}
+	trace_smb3_tcon_ref(tcon->debug_id, tcon->tc_count, trace);
 	free_cached_dirs(tcon->cfids);
 	atomic_dec(&tconInfoAllocCount);
 	kfree(tcon->nativeFileSystem);
@@ -848,7 +855,7 @@ void cifs_close_all_deferred_files_sb(struct cifs_sb_info *cifs_sb)
 	list_for_each_entry_safe(tmp_list, q, &tcon_head, entry) {
 		cifs_close_all_deferred_files(tmp_list->tcon);
 		list_del(&tmp_list->entry);
-		cifs_put_tcon(tmp_list->tcon);
+		cifs_put_tcon(tmp_list->tcon, netfs_trace_tcon_ref_put_tlink);
 		kfree(tmp_list);
 	}
 }
@@ -984,6 +991,10 @@ parse_dfs_referrals(struct get_dfs_referral_rsp *rsp, u32 rsp_size,
 		node->ref_flag = le16_to_cpu(ref->ReferralEntryFlags);
 
 		/* copy DfsPath */
+		if (le16_to_cpu(ref->DfsPathOffset) > data_end - (char *)ref) {
+			rc = -EINVAL;
+			goto parse_DFS_referrals_exit;
+		}
 		temp = (char *)ref + le16_to_cpu(ref->DfsPathOffset);
 		max_len = data_end - temp;
 		node->path_name = cifs_strndup_from_utf16(temp, max_len,
@@ -994,6 +1005,10 @@ parse_dfs_referrals(struct get_dfs_referral_rsp *rsp, u32 rsp_size,
 		}
 
 		/* copy link target UNC */
+		if (le16_to_cpu(ref->NetworkAddressOffset) > data_end - (char *)ref) {
+			rc = -EINVAL;
+			goto parse_DFS_referrals_exit;
+		}
 		temp = (char *)ref + le16_to_cpu(ref->NetworkAddressOffset);
 		max_len = data_end - temp;
 		node->node_name = cifs_strndup_from_utf16(temp, max_len,
