@@ -268,6 +268,8 @@ extern unsigned int sched_boost_type; /* currently activated sched boost */
 extern enum sched_boost_policy boost_policy;
 extern unsigned int sysctl_input_boost_ms;
 extern unsigned int sysctl_input_boost_freq[8];
+extern unsigned int sysctl_fod_boost_ms;
+extern unsigned int sysctl_fod_boost_freq[8];
 extern unsigned int sysctl_sched_boost_on_input;
 extern unsigned int sysctl_sched_user_hint;
 extern unsigned int sysctl_sched_conservative_pl;

@@ -55,8 +55,58 @@ static bool sched_boost_active;
 static struct delayed_work input_boost_rem;
 static u64 last_input_time;
 #define MIN_INPUT_INTERVAL (150 * USEC_PER_MSEC)
+/* BTN_INFO in Xiaomi's private touchscreen header. */
+#define XIAOMI_BTN_FOD 0x152
 
 static DEFINE_PER_CPU(struct freq_qos_request, qos_req);
+static DEFINE_PER_CPU(struct freq_qos_request, fod_qos_req);
+static struct work_struct fod_boost_work;
+static struct delayed_work fod_boost_rem;
+
+static void do_fod_boost_rem(struct work_struct *work)
+{
+	unsigned int cpu;
+	int ret;
+	struct freq_qos_request *req;
+
+	for_each_possible_cpu(cpu) {
+		req = &per_cpu(fod_qos_req, cpu);
+		if (!freq_qos_request_active(req))
+			continue;
+		ret = freq_qos_update_request(req, 0);
+		if (ret < 0)
+			pr_err("Failed to release FOD constraint: %d\n", ret);
+	}
+}
+
+static void do_fod_boost(struct work_struct *work)
+{
+	unsigned int duration = READ_ONCE(sysctl_fod_boost_ms);
+	struct freq_qos_request *req;
+	bool boosted = false;
+	unsigned int cpu;
+	int ret;
+
+	if (!duration)
+		return;
+
+	cancel_delayed_work_sync(&fod_boost_rem);
+	for_each_possible_cpu(cpu) {
+		if (cpu >= ARRAY_SIZE(sysctl_fod_boost_freq))
+			continue;
+		req = &per_cpu(fod_qos_req, cpu);
+		if (!freq_qos_request_active(req))
+			continue;
+		ret = freq_qos_update_request(req,
+				READ_ONCE(sysctl_fod_boost_freq[cpu]));
+		if (ret < 0)
+			pr_err("Failed to apply FOD constraint: %d\n", ret);
+		boosted = true;
+	}
+	if (boosted)
+		queue_delayed_work(input_boost_wq, &fod_boost_rem,
+				msecs_to_jiffies(duration));
+}
 
 static void boost_adjust_notify(struct cpufreq_policy *policy)
 {
@@ -178,6 +228,18 @@ static void inputboost_input_event(struct input_handle *handle,
 	int cpu;
 	int enabled = 0;
 
+	/*
+	 * Xiaomi FOD down is BTN_INFO on the multitouch device. It arrives
+	 * before the framework wakes the display; ordinary input release must
+	 * not remove this separate, bounded frequency request.
+	 */
+	if (type == EV_KEY && code == XIAOMI_BTN_FOD && value == 1 &&
+	    test_bit(EV_ABS, handle->dev->evbit) &&
+	    test_bit(ABS_MT_POSITION_X, handle->dev->absbit) &&
+	    test_bit(ABS_MT_POSITION_Y, handle->dev->absbit) &&
+	    READ_ONCE(sysctl_fod_boost_ms))
+		queue_work(input_boost_wq, &fod_boost_work);
+
 	for_each_possible_cpu(cpu) {
 		if (sysctl_input_boost_freq[cpu] > 0) {
 			enabled = 1;
@@ -285,6 +347,8 @@ int input_boost_init(void)
 
 	INIT_WORK(&input_boost_work, do_input_boost);
 	INIT_DELAYED_WORK(&input_boost_rem, do_input_boost_rem);
+	INIT_WORK(&fod_boost_work, do_fod_boost);
+	INIT_DELAYED_WORK(&fod_boost_rem, do_fod_boost_rem);
 
 	for_each_possible_cpu(cpu) {
 		s = &per_cpu(sync_info, cpu);
@@ -305,6 +369,12 @@ int input_boost_init(void)
 		}
 		ret = freq_qos_add_request(&policy->constraints, req,
 						FREQ_QOS_MIN, 0);
+		if (ret >= 0) {
+			req = &per_cpu(fod_qos_req,
+					cpumask_first(policy->related_cpus));
+			ret = freq_qos_add_request(&policy->constraints, req,
+						FREQ_QOS_MIN, 0);
+		}
 		cpufreq_cpu_put(policy);
 		if (ret < 0) {
 			pr_err("%s: Failed to add freq constraint (%d)\n",
@@ -319,8 +389,15 @@ int input_boost_init(void)
 	return 0;
 
 err_requests:
+	cancel_work_sync(&input_boost_work);
+	cancel_work_sync(&fod_boost_work);
+	cancel_delayed_work_sync(&input_boost_rem);
+	cancel_delayed_work_sync(&fod_boost_rem);
 	for_each_possible_cpu(cpu) {
 		req = &per_cpu(qos_req, cpu);
+		if (freq_qos_request_active(req))
+			freq_qos_remove_request(req);
+		req = &per_cpu(fod_qos_req, cpu);
 		if (freq_qos_request_active(req))
 			freq_qos_remove_request(req);
 	}

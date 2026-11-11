@@ -47,6 +47,9 @@ unsigned int sysctl_sched_boost;
 unsigned int sysctl_sched_wake_up_idle[2];
 unsigned int sysctl_input_boost_ms;
 unsigned int sysctl_input_boost_freq[8];
+/* Disabled until a device configures the touchscreen FOD boost. */
+unsigned int sysctl_fod_boost_ms;
+unsigned int sysctl_fod_boost_freq[8];
 unsigned int sysctl_sched_boost_on_input;
 unsigned int sysctl_sched_early_up[MAX_MARGIN_LEVELS];
 unsigned int sysctl_sched_early_down[MAX_MARGIN_LEVELS];
@@ -898,6 +901,24 @@ struct ctl_table input_boost_sysctls[] = {
 		.procname	= "input_boost_freq",
 		.data		= &sysctl_input_boost_freq,
 		.maxlen		= sizeof(unsigned int) * 8,
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_INT_MAX,
+	},
+	{
+		.procname	= "fod_boost_ms",
+		.data		= &sysctl_fod_boost_ms,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= &one_thousand,
+	},
+	{
+		.procname	= "fod_boost_freq",
+		.data		= &sysctl_fod_boost_freq,
+		.maxlen		= sizeof(sysctl_fod_boost_freq),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
